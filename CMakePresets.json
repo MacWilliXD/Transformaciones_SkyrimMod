@@ -1,0 +1,24 @@
+{
+    "version": 3,
+    "configurePresets": [
+        {
+            "name": "release",
+            "displayName": "Release (compila fuera de OneDrive)",
+            "generator": "Ninja",
+            "binaryDir": "C:/Users/ASUS/build/Transformaciones/${presetName}",
+            "architecture": { "value": "x64", "strategy": "external" },
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "CMAKE_CXX_COMPILER": "cl.exe",
+                "CMAKE_CXX_FLAGS": "/permissive- /Zc:preprocessor /EHsc /MP /W4 /utf-8 -DWIN32_LEAN_AND_MEAN -DNOMINMAX -DUNICODE -D_UNICODE",
+                "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+                "VCPKG_TARGET_TRIPLET": "x64-windows-static-md",
+                "VCPKG_INSTALLED_DIR": "C:/Users/ASUS/build/Transformaciones/vcpkg_installed",
+                "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreadedDLL"
+            }
+        }
+    ],
+    "buildPresets": [
+        { "name": "release", "configurePreset": "release" }
+    ]
+}

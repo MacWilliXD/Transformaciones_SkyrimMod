@@ -1,0 +1,15 @@
+{
+    "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+    "name": "transformaciones",
+    "version-string": "0.1.0",
+    "description": "Menú de administración para transformarse en cualquier personaje o criatura de Skyrim",
+    "dependencies": [
+        "commonlibsse-ng",
+        {
+            "name": "imgui",
+            "features": [
+                "dx11-binding"
+            ]
+        }
+    ]
+}
