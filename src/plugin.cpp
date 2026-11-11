@@ -18,6 +18,10 @@
 #include <windows.h>
 
 #include <array>
+#include <bit>
+#include <fstream>
+#include <optional>
+#include <sstream>
 #include <atomic>
 #include <chrono>
 #include <mutex>
@@ -30,8 +34,6 @@ namespace
 {
     // F9 es la carga rápida de Skyrim: abriría el menú y cargaría la partida a la vez.
     constexpr std::uint32_t TECLA_POR_DEFECTO = 0x57;  // F11
-    constexpr std::uint32_t ID_GUARDADO = 'TRNF';
-    constexpr std::uint32_t REGISTRO_RAZA = 'ORIG';
 
     std::uint32_t tecla = TECLA_POR_DEFECTO;
 
@@ -102,6 +104,7 @@ namespace
         std::string   busqueda;
         RE::FormID    raza{ 0 };
         RE::FormID    piel{ 0 };  // la del NPC; 0: la de la raza
+        RE::FormID    npc{ 0 };   // de quién se copia la cara (personas)
         std::uint32_t copias{ 1 };
         Pestana       pestana{ Pestana::kCriaturas };
     };
@@ -177,9 +180,53 @@ namespace
         return grafo && Minusculas(grafo) == R"(actors\character\defaultmale.hkx)";
     }
 
-    // Se agrupan por raza y piel: es lo que cambia al transformarse. Así los lobos de nieve y los
-    // draugr de cada tipo salen aparte, y dos criaturas que comparten raza no se juntan si tienen
-    // pieles distintas. De cada grupo queda el nombre que más NPC usan; los demás van a Ocultos.
+    // El NPC del que salen los rasgos: si hereda los rasgos de otro NPC (plantilla), ese otro.
+    RE::TESNPC* FuenteDeRasgos(RE::TESNPC* npc)
+    {
+        for (int nivel = 0; npc && nivel < 8; ++nivel) {
+            if (!npc->UsesTemplate() || !npc->actorData.templateUseFlags.any(RE::ACTOR_BASE_DATA::TEMPLATE_USE_FLAG::kTraits)) break;
+            auto* plantilla = npc->baseTemplateForm ? npc->baseTemplateForm->As<RE::TESNPC>() : nullptr;
+            if (!plantilla) break;
+            npc = plantilla;
+        }
+        return npc;
+    }
+
+    std::uint32_t ColorEntero(RE::Color c)
+    {
+        return (static_cast<std::uint32_t>(c.red) << 24) | (static_cast<std::uint32_t>(c.green) << 16) | (static_cast<std::uint32_t>(c.blue) << 8) | c.alpha;
+    }
+
+    // Todo lo que se copia de una persona, en texto: dos NPC con la misma huella se ven igual.
+    std::string HuellaDeCara(RE::TESNPC* original, RE::TESRace* raza, RE::FormID piel)
+    {
+        auto*       npc = FuenteDeRasgos(original);
+        std::string h = std::format("{:08X}|{}|{:08X}|{:.1f}|{:.2f}|{:08X}", raza->GetFormID(), npc->IsFemale(), piel, npc->weight, npc->height,
+                                    ColorEntero(npc->bodyTintColor));
+        if (npc->headRelatedData) {
+            const auto* hr = npc->headRelatedData;
+            h += std::format("|{:08X}|{:08X}", hr->hairColor ? hr->hairColor->GetFormID() : 0, hr->faceDetails ? hr->faceDetails->GetFormID() : 0);
+        }
+        for (std::int8_t i = 0; npc->headParts && i < npc->numHeadParts; ++i) {
+            h += std::format("|p{:08X}", npc->headParts[i] ? npc->headParts[i]->GetFormID() : 0);
+        }
+        if (npc->faceData) {
+            for (const float m : npc->faceData->morphs) h += std::format("|{:.2f}", m);
+            for (const auto pr : npc->faceData->parts) h += std::format("|{}", pr);
+        }
+        if (npc->tintLayers) {
+            for (const auto* capa : *npc->tintLayers) {
+                if (capa) h += std::format("|t{}:{:08X}:{}", capa->tintIndex, ColorEntero(capa->tintColor), capa->interpolationValue);
+            }
+        }
+        return h;
+    }
+
+    // Criaturas: se agrupan por raza y piel, que es lo que cambia al transformarse. Así los lobos
+    // de nieve y los draugr de cada tipo salen aparte, y dos criaturas que comparten raza no se
+    // juntan si tienen pieles distintas. Personas: se copia toda su cara, así que solo se juntan
+    // las que se ven exactamente igual. De cada grupo queda el nombre que más NPC usan; los
+    // demás van a Ocultos.
     void CargarLista()
     {
         auto* datos = RE::TESDataHandler::GetSingleton();
@@ -193,11 +240,13 @@ namespace
             std::string   archivo;
             RE::TESRace*  raza{ nullptr };
             RE::FormID    piel{ 0 };
+            RE::FormID    npc{ 0 };
+            bool          mujer{ false };
             std::uint32_t copias{ 0 };
         };
-        std::vector<Variante>                                       variantes;
-        std::unordered_map<std::string, std::size_t>                porNombre;  // nombre|raza|piel
-        std::unordered_map<std::uint64_t, std::vector<std::size_t>> grupos;     // raza y piel efectiva
+        std::vector<Variante>                                     variantes;
+        std::unordered_map<std::string, std::size_t>              porNombre;  // nombre|grupo
+        std::unordered_map<std::string, std::vector<std::size_t>> grupos;     // criaturas: raza y piel; personas: su cara
 
         for (auto* npc : datos->GetFormArray<RE::TESNPC>()) {
             if (!npc) continue;
@@ -213,12 +262,13 @@ namespace
             auto*            piel = PielDe(npc);
             const RE::FormID efectiva = piel ? piel->GetFormID() : (raza->skin ? raza->skin->GetFormID() : 0);
             const auto       nombreUtf8 = AUtf8(nombre);
-            const auto       clave = std::format("{}|{:08X}|{:08X}", nombreUtf8, raza->GetFormID(), efectiva);
-            auto [it, nueva] = porNombre.try_emplace(clave, variantes.size());
+            const auto       grupo = EsHumana(raza) ? HuellaDeCara(npc, raza, efectiva) : std::format("{:08X}|{:08X}", raza->GetFormID(), efectiva);
+            auto [it, nueva] = porNombre.try_emplace(nombreUtf8 + "|" + grupo, variantes.size());
             if (nueva) {
                 const auto* archivo = npc->GetFile(0);
-                variantes.push_back({ nombreUtf8, archivo ? std::string{ archivo->GetFilename() } : "?"s, raza, piel ? piel->GetFormID() : 0, 0 });
-                grupos[(static_cast<std::uint64_t>(raza->GetFormID()) << 32) | efectiva].push_back(it->second);
+                variantes.push_back({ nombreUtf8, archivo ? std::string{ archivo->GetFilename() } : "?"s, raza, piel ? piel->GetFormID() : 0,
+                                      npc->GetFormID(), FuenteDeRasgos(npc)->IsFemale(), 0 });
+                grupos[grupo].push_back(it->second);
             }
             ++variantes[it->second].copias;
         }
@@ -242,14 +292,15 @@ namespace
                 Entrada e;
                 e.raza = v.raza->GetFormID();
                 e.piel = v.piel;
+                e.npc = v.npc;
                 e.copias = v.copias;
                 if (i == principal) {
                     const auto otros = indices.size() - 1;
                     const auto iguales = otros ? std::format("   +{} iguales", otros) : "";
                     if (EsHumana(v.raza)) {
-                        // Con una persona solo cambia la raza (la cara sigue siendo la tuya): va delante.
                         e.pestana = Pestana::kHumanos;
-                        e.etiqueta = std::format("{}{}   -   como {}   ({}){}", razaVisible, Avisos(v.raza), v.nombre, v.archivo, iguales);
+                        e.etiqueta = std::format("{}   -   {}, {}{}   ({}){}", v.nombre, razaVisible, v.mujer ? "mujer" : "hombre", Avisos(v.raza),
+                                                 v.archivo, iguales);
                     } else {
                         e.pestana = Pestana::kCriaturas;
                         e.etiqueta = std::format("{}   -   {}{}   ({}){}", v.nombre, razaVisible, Avisos(v.raza), v.archivo, iguales);
@@ -271,9 +322,8 @@ namespace
 
     // ---- Cambio de raza -------------------------------------------------------------------
 
-    std::atomic<RE::FormID> razaOriginal{ 0 };  // 0: no transformado
-    std::atomic<RE::FormID> pielOriginal{ 0 };  // la piel de la base del jugador antes; 0: ninguna
-    std::atomic<bool>       abierto{ false };   // el menú
+    std::atomic<bool> transformado{ false };  // hay un aspecto original al que volver
+    std::atomic<bool> abierto{ false };       // el menú
     std::string             estado;
     std::mutex              mutexEstado;
 
@@ -437,58 +487,503 @@ namespace
     std::atomic<bool> cambioPropio{ false };     // el próximo fin de cambio de raza es nuestro
     std::atomic<bool> desatascarAlVolver{ false };
 
-    // La piel del NPC se pone en la base del jugador antes de cambiar la raza, que vuelve a cargar
-    // el modelo con ella. Si la raza no cambia (de lobo a lobo de nieve), se recarga el modelo.
-    void CambiarRaza(RE::FormID idRaza, RE::FormID idPiel, bool volviendo)
+    // ---- Apariencia -----------------------------------------------------------------------
+    //
+    // Con una criatura basta la raza y la piel. Con una persona, lo que la hace reconocible es su
+    // cara: se copian a la ficha del jugador los mismos datos del menú de creación de personaje
+    // (y de la apariencia que sincroniza SkyMP): sexo, raza, piel, peso, altura, color de piel y
+    // de pelo, textura de la cara, partes de la cabeza, rasgos, preajustes y pinturas. La ropa no.
+    //
+    // Antes de la primera transformación se guarda el aspecto del jugador, en memoria y en un
+    // archivo por personaje (SkyMP no usa las partidas guardadas), y "Volver" lo restaura tal cual.
+
+    // La TintMask del juego, que CommonLib solo declara (la misma que usan SKSE y SkyMP).
+    struct MascaraDeTinte
     {
-        SKSE::GetTaskInterface()->AddTask([idRaza, idPiel, volviendo]() {
-            auto* jugador = RE::PlayerCharacter::GetSingleton();
-            auto* base = jugador ? jugador->GetActorBase() : nullptr;
-            auto* raza = RE::TESForm::LookupByID<RE::TESRace>(idRaza);
-            auto* piel = idPiel ? RE::TESForm::LookupByID<RE::TESObjectARMO>(idPiel) : nullptr;
-            if (!jugador || !base || !raza) {
-                PonerEstado("No encuentro esa raza.");
+        RE::TESTexture* texture;
+        RE::Color       color;
+        float           alpha;
+        std::uint32_t   tintType;
+    };
+    static_assert(sizeof(MascaraDeTinte) == 0x18);
+
+    constexpr std::uint32_t TINTE_TONO_DE_PIEL = 6;  // TintLayer::SkinTone::kSkinTone
+
+    struct Tinte
+    {
+        std::string   ruta;
+        std::uint32_t tipo{ 0 };
+        RE::Color     color{};
+        float         alfa{ 0 };
+    };
+
+    struct Apariencia
+    {
+        bool                        conCara{ true };  // false: solo raza y piel (criaturas)
+        RE::TESRace*                raza{ nullptr };
+        RE::TESObjectARMO*          piel{ nullptr };
+        bool                        mujer{ false };
+        float                       peso{ 50.0f };
+        float                       altura{ 1.0f };
+        RE::Color                   colorPiel{};
+        RE::BGSColorForm*           colorPelo{ nullptr };
+        std::optional<RE::Color>    valorColorPelo;  // por si el color de pelo era una forma creada en partida
+        RE::BGSTextureSet*          texturaCara{ nullptr };
+        std::vector<RE::BGSHeadPart*> partes;
+        std::array<float, RE::TESNPC::FaceData::Morphs::kTotal>      rasgos{};
+        std::array<std::int32_t, RE::TESNPC::FaceData::Parts::kTotal> preajustes{};
+        std::vector<Tinte>          tintes;
+    };
+
+    std::optional<Apariencia> original;   // el aspecto del jugador antes de transformarse
+    std::optional<Apariencia> caraPendiente;  // la cara que se pone al terminar el cambio de raza
+
+    auto* PinturasDeRaza(RE::TESRace* raza, bool mujer)
+    {
+        auto* cara = raza ? raza->faceRelatedData[mujer ? RE::SEXES::kFemale : RE::SEXES::kMale] : nullptr;
+        return cara ? cara->tintMasks : nullptr;
+    }
+
+    // Una textura propia para una pintura que no está entre las de la raza (por ejemplo, una que
+    // venía de SkyMP). Se le copia la tabla virtual de una de verdad, para que sea un objeto válido.
+    RE::TESTexture* TexturaPropia(const std::string& ruta)
+    {
+        static void* tabla = nullptr;
+        if (!tabla) {
+            if (auto* datos = RE::TESDataHandler::GetSingleton()) {
+                for (auto* raza : datos->GetFormArray<RE::TESRace>()) {
+                    auto* pinturas = PinturasDeRaza(raza, false);
+                    if (pinturas && !pinturas->empty() && (*pinturas)[0]) {
+                        tabla = *reinterpret_cast<void**>(&(*pinturas)[0]->texture.file);
+                        break;
+                    }
+                }
+            }
+        }
+        if (!tabla) return nullptr;
+        auto* textura = RE::calloc<RE::TESTexture>(1);
+        *reinterpret_cast<void**>(textura) = tabla;
+        new (&textura->textureName) RE::BSFixedString(ruta.c_str());
+        return textura;
+    }
+
+    // La textura de la pintura en la raza (es la que usa el juego); si no está, una propia.
+    RE::TESTexture* TexturaDeTinte(RE::TESRace* raza, bool mujer, const std::string& ruta)
+    {
+        if (auto* pinturas = PinturasDeRaza(raza, mujer)) {
+            const auto buscada = Minusculas(ruta);
+            for (auto* activo : *pinturas) {
+                if (activo && Minusculas(activo->texture.file.textureName.c_str()) == buscada) return &activo->texture.file;
+            }
+        }
+        return ruta.empty() ? nullptr : TexturaPropia(ruta);
+    }
+
+    Apariencia CapturarJugador(RE::PlayerCharacter* jugador)
+    {
+        Apariencia a;
+        auto*      base = jugador->GetActorBase();
+        a.raza = jugador->GetRace();
+        a.piel = base->skin;
+        a.mujer = base->IsFemale();
+        a.peso = base->weight;
+        a.altura = base->height;
+        a.colorPiel = base->bodyTintColor;
+        if (const auto* hr = base->headRelatedData) {
+            a.colorPelo = hr->hairColor;
+            a.texturaCara = hr->faceDetails;
+        }
+        if (a.colorPelo) a.valorColorPelo = a.colorPelo->color;
+        for (std::int8_t i = 0; base->headParts && i < base->numHeadParts; ++i) {
+            if (base->headParts[i]) a.partes.push_back(base->headParts[i]);
+        }
+        if (base->faceData) {
+            std::ranges::copy(base->faceData->morphs, a.rasgos.begin());
+            std::ranges::copy(base->faceData->parts, a.preajustes.begin());
+        }
+        if (auto* lista = jugador->GetTintList()) {
+            for (auto* m : *lista) {
+                const auto* t = reinterpret_cast<const MascaraDeTinte*>(m);
+                if (!t) continue;
+                a.tintes.push_back({ t->texture ? t->texture->textureName.c_str() : "", t->tintType, t->color, t->alpha });
+            }
+        }
+        return a;
+    }
+
+    // El aspecto de un NPC. Las pinturas de un NPC son "índice de pintura de su raza + color +
+    // intensidad"; el jugador tiene una lista de texturas, que se sacan de las pinturas de la raza.
+    Apariencia DesdeNpc(RE::TESNPC* elegido)
+    {
+        auto*      npc = FuenteDeRasgos(elegido);
+        Apariencia a;
+        a.raza = elegido->GetRace();
+        a.piel = PielDe(elegido);
+        a.mujer = npc->IsFemale();
+        a.peso = npc->weight;
+        a.altura = npc->height;
+        a.colorPiel = npc->bodyTintColor;
+        if (const auto* hr = npc->headRelatedData) {
+            a.colorPelo = hr->hairColor;
+            a.texturaCara = hr->faceDetails;
+        }
+        for (std::int8_t i = 0; npc->headParts && i < npc->numHeadParts; ++i) {
+            if (npc->headParts[i]) a.partes.push_back(npc->headParts[i]);
+        }
+        if (npc->faceData) {
+            std::ranges::copy(npc->faceData->morphs, a.rasgos.begin());
+            std::ranges::copy(npc->faceData->parts, a.preajustes.begin());
+        }
+        auto* pinturas = PinturasDeRaza(a.raza, a.mujer);
+        bool  tonoDePiel = false;
+        if (npc->tintLayers && pinturas) {
+            for (const auto* capa : *npc->tintLayers) {
+                if (!capa) continue;
+                for (auto* activo : *pinturas) {
+                    if (!activo || activo->texture.index != capa->tintIndex) continue;
+                    Tinte t;
+                    t.ruta = activo->texture.file.textureName.c_str();
+                    t.tipo = activo->texture.skinTone.underlying();
+                    t.alfa = std::clamp(capa->interpolationValue / 100.0f, 0.0f, 1.0f);
+                    t.color = capa->tintColor;
+                    t.color.alpha = static_cast<std::uint8_t>(t.alfa * 255.0f);
+                    tonoDePiel = tonoDePiel || t.tipo == TINTE_TONO_DE_PIEL;
+                    a.tintes.push_back(std::move(t));
+                    break;
+                }
+            }
+        }
+        // Sin pintura de tono de piel, la cara quedaría de otro color que el cuerpo.
+        if (!tonoDePiel && pinturas) {
+            for (auto* activo : *pinturas) {
+                if (activo && activo->texture.skinTone.underlying() == TINTE_TONO_DE_PIEL) {
+                    Tinte t{ activo->texture.file.textureName.c_str(), TINTE_TONO_DE_PIEL, a.colorPiel, 1.0f };
+                    t.color.alpha = 255;
+                    a.tintes.push_back(std::move(t));
+                    break;
+                }
+            }
+        }
+        return a;
+    }
+
+    RE::BGSColorForm* CrearColor(RE::Color color)
+    {
+        auto* fabrica = RE::IFormFactory::GetConcreteFormFactoryByType<RE::BGSColorForm>();
+        auto* forma = fabrica ? static_cast<RE::BGSColorForm*>(fabrica->Create()) : nullptr;
+        if (forma) forma->color = color;
+        return forma;
+    }
+
+    // Como en SkyMP: fuera las pinturas invisibles, y nunca dos pinturas de guerra visibles a la
+    // vez (una de la raza y otra general), porque el juego se cierra.
+    std::vector<const Tinte*> PinturasVisibles(const std::vector<Tinte>& tintes)
+    {
+        std::vector<const Tinte*> visibles;
+        bool                      guerra = false;
+        for (const auto& t : tintes) {
+            if (t.color.alpha == 0 && t.alfa <= 0.0f) continue;
+            if (Minusculas(t.ruta).find("warpaint") != std::string::npos) {
+                if (guerra) continue;
+                guerra = true;
+            }
+            visibles.push_back(&t);
+        }
+        return visibles;
+    }
+
+    // En el hilo principal. Pone la cara en la ficha del jugador; el modelo se recarga aparte.
+    // La raza solo con ponerRaza, una vez hecho el SetRace: si la ficha ya tiene la raza nueva,
+    // SetRace cree que no hay nada que cambiar y no cambia el esqueleto ni avisa al terminar.
+    void AplicarCara(RE::PlayerCharacter* jugador, const Apariencia& a, bool ponerRaza)
+    {
+        auto* base = jugador->GetActorBase();
+        if (!base) return;
+        if (a.mujer) {
+            base->actorData.actorBaseFlags.set(RE::ACTOR_BASE_DATA::Flag::kFemale);
+        } else {
+            base->actorData.actorBaseFlags.reset(RE::ACTOR_BASE_DATA::Flag::kFemale);
+        }
+        if (ponerRaza && a.raza) base->race = a.raza;
+        base->skin = a.piel;
+        base->weight = a.peso;
+        base->height = a.altura;
+        base->bodyTintColor = a.colorPiel;
+        auto* pelo = a.colorPelo;
+        if (!pelo && a.valorColorPelo) pelo = CrearColor(*a.valorColorPelo);
+        base->SetHairColor(pelo);
+        base->SetFaceTexture(a.texturaCara);
+
+        // Una lista nueva: la vieja puede ser la de otro NPC o la del original, que se conserva.
+        RE::BGSHeadPart** partes = nullptr;
+        if (!a.partes.empty()) {
+            partes = RE::calloc<RE::BGSHeadPart*>(a.partes.size());
+            std::ranges::copy(a.partes, partes);
+        }
+        base->headParts = partes;
+        base->numHeadParts = static_cast<std::int8_t>(a.partes.size());
+
+        if (!base->faceData) base->faceData = RE::calloc<RE::TESNPC::FaceData>(1);
+        if (base->faceData) {
+            std::ranges::copy(a.rasgos, base->faceData->morphs);
+            std::ranges::copy(a.preajustes, base->faceData->parts);
+        }
+
+        if (auto* lista = jugador->GetTintList()) {
+            lista->clear();
+            for (const auto* t : PinturasVisibles(a.tintes)) {
+                auto* textura = TexturaDeTinte(a.raza, a.mujer, t->ruta);
+                if (!textura) continue;
+                auto* m = RE::calloc<MascaraDeTinte>(1);
+                m->texture = textura;
+                m->color = t->color;
+                m->alpha = t->alfa;
+                m->tintType = t->tipo;
+                lista->push_back(reinterpret_cast<RE::TintMask*>(m));
+            }
+        }
+        spdlog::info("  cara: {}, {} partes de la cabeza, {} pinturas, peso {:.0f}, altura {:.2f}", a.mujer ? "mujer" : "hombre", a.partes.size(),
+                     a.tintes.size(), a.peso, a.altura);
+    }
+
+    // ---- Archivo con el aspecto original ----
+    //
+    // Data\SKSE\Plugins\Transformaciones\<personaje>.txt. Las formas se guardan como
+    // "plugin|id local", que no depende del orden de carga.
+
+    std::filesystem::path RutaOriginal()
+    {
+        auto*       jugador = RE::PlayerCharacter::GetSingleton();
+        auto*       base = jugador ? jugador->GetActorBase() : nullptr;
+        std::string nombre = base && base->GetName() ? base->GetName() : "";
+        for (auto& c : nombre) {
+            if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_') c = '_';
+        }
+        if (nombre.empty()) nombre = "jugador";
+        return rutaIni.parent_path() / "Transformaciones" / (nombre + ".txt");
+    }
+
+    std::string Referencia(const RE::TESForm* forma)
+    {
+        const auto* archivo = forma ? forma->GetFile(0) : nullptr;
+        return archivo ? std::format("{}|{:X}", archivo->GetFilename(), forma->GetLocalFormID()) : "";
+    }
+
+    template <class T>
+    T* Resolver(const std::string& texto)
+    {
+        const auto barra = texto.rfind('|');
+        auto*      datos = RE::TESDataHandler::GetSingleton();
+        if (barra == std::string::npos || !datos) return nullptr;
+        const auto id = static_cast<RE::FormID>(std::strtoul(texto.c_str() + barra + 1, nullptr, 16));
+        return datos->LookupForm<T>(id, texto.substr(0, barra));
+    }
+
+    std::string Color(RE::Color c) { return std::format("{} {} {} {}", c.red, c.green, c.blue, c.alpha); }
+
+    RE::Color LeerColor(const std::string& texto)
+    {
+        unsigned r = 0, g = 0, b = 0, a = 0;
+        sscanf_s(texto.c_str(), "%u %u %u %u", &r, &g, &b, &a);
+        return RE::Color(static_cast<std::uint8_t>(r), static_cast<std::uint8_t>(g), static_cast<std::uint8_t>(b), static_cast<std::uint8_t>(a));
+    }
+
+    void GuardarOriginal(const Apariencia& a)
+    {
+        const auto ruta = RutaOriginal();
+        std::error_code error;
+        std::filesystem::create_directories(ruta.parent_path(), error);
+        std::ofstream f(ruta, std::ios::trunc);
+        f << "# Aspecto original de este personaje, para volver a él (Transformaciones). No lo borres estando transformado.\n";
+        f << "raza=" << Referencia(a.raza) << "\npiel=" << Referencia(a.piel) << "\nmujer=" << a.mujer << "\npeso=" << a.peso << "\naltura=" << a.altura
+          << "\ncolorPiel=" << Color(a.colorPiel) << "\ncolorPelo=" << Referencia(a.colorPelo) << "\n";
+        if (a.valorColorPelo) f << "valorColorPelo=" << Color(*a.valorColorPelo) << "\n";
+        f << "texturaCara=" << Referencia(a.texturaCara) << "\n";
+        for (const auto* parte : a.partes) f << "parte=" << Referencia(parte) << "\n";
+        f << "rasgos=";
+        for (const float r : a.rasgos) f << r << " ";
+        f << "\npreajustes=";
+        for (const auto p : a.preajustes) f << p << " ";
+        f << "\n";
+        for (const auto& t : a.tintes) f << "tinte=" << t.tipo << "|" << Color(t.color) << "|" << t.alfa << "|" << t.ruta << "\n";
+        spdlog::info("Aspecto original guardado en {}", ruta.string());
+    }
+
+    std::optional<Apariencia> LeerOriginal()
+    {
+        std::ifstream f(RutaOriginal());
+        if (!f) return std::nullopt;
+        Apariencia  a;
+        std::string linea;
+        while (std::getline(f, linea)) {
+            const auto igual = linea.find('=');
+            if (linea.empty() || linea[0] == '#' || igual == std::string::npos) continue;
+            const auto clave = linea.substr(0, igual);
+            const auto valor = linea.substr(igual + 1);
+            if (clave == "raza") a.raza = Resolver<RE::TESRace>(valor);
+            else if (clave == "piel") a.piel = Resolver<RE::TESObjectARMO>(valor);
+            else if (clave == "mujer") a.mujer = valor == "1";
+            else if (clave == "peso") a.peso = std::strtof(valor.c_str(), nullptr);
+            else if (clave == "altura") a.altura = std::strtof(valor.c_str(), nullptr);
+            else if (clave == "colorPiel") a.colorPiel = LeerColor(valor);
+            else if (clave == "colorPelo") a.colorPelo = Resolver<RE::BGSColorForm>(valor);
+            else if (clave == "valorColorPelo") a.valorColorPelo = LeerColor(valor);
+            else if (clave == "texturaCara") a.texturaCara = Resolver<RE::BGSTextureSet>(valor);
+            else if (clave == "parte") {
+                if (auto* parte = Resolver<RE::BGSHeadPart>(valor)) a.partes.push_back(parte);
+            } else if (clave == "rasgos") {
+                std::istringstream e(valor);
+                for (auto& r : a.rasgos) e >> r;
+            } else if (clave == "preajustes") {
+                std::istringstream e(valor);
+                for (auto& p : a.preajustes) e >> p;
+            } else if (clave == "tinte") {
+                // tipo|r g b a|alfa|ruta (la ruta puede llevar cualquier cosa menos saltos de línea)
+                const auto b1 = valor.find('|'), b2 = valor.find('|', b1 + 1), b3 = valor.find('|', b2 + 1);
+                if (b3 == std::string::npos) continue;
+                a.tintes.push_back({ valor.substr(b3 + 1), static_cast<std::uint32_t>(std::strtoul(valor.c_str(), nullptr, 10)),
+                                     LeerColor(valor.substr(b1 + 1, b2 - b1 - 1)), std::strtof(valor.c_str() + b2 + 1, nullptr) });
+            }
+        }
+        if (!a.raza) {
+            spdlog::warn("Aspecto original: no encuentro la raza guardada en {}", RutaOriginal().string());
+            return std::nullopt;
+        }
+        return a;
+    }
+
+    // En el hilo principal, al abrir el menú: si hay un aspecto original guardado de este
+    // personaje (de otra sesión), "Volver" lo restaura.
+    void CargarOriginal()
+    {
+        if (original) return;
+        if (auto leido = LeerOriginal()) {
+            original = std::move(leido);
+            transformado = true;
+            spdlog::info("Aspecto original leído de {}", RutaOriginal().string());
+        }
+    }
+
+    std::atomic<int> numeroDeCambio{ 0 };  // para saber si el aviso de 3 segundos sigue siendo del último
+
+    // En el hilo principal, al terminar un cambio de raza nuestro.
+    void AplicarCaraPendiente()
+    {
+        auto* jugador = RE::PlayerCharacter::GetSingleton();
+        if (!jugador || !caraPendiente) return;
+        spdlog::info("Cambio de raza terminado: se pone la cara");
+        AplicarCara(jugador, *caraPendiente, true);
+        caraPendiente.reset();
+        jugador->DoReset3D(true);
+    }
+
+    // Si el juego no avisa del fin del cambio de raza, la cara no se queda esperando: a los 3
+    // segundos se pone igualmente. Si se quedara, la pondría encima de la siguiente transformación
+    // (una cara de persona sobre el esqueleto de una criatura).
+    void VigilarCambioDeRaza()
+    {
+        const int numero = numeroDeCambio.load();
+        std::thread([numero]() {
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+            SKSE::GetTaskInterface()->AddTask([numero]() {
+                if (numero != numeroDeCambio.load() || !caraPendiente) return;
+                spdlog::warn("  el cambio de raza no avisó al terminar: se pone la cara igualmente");
+                cambioPropio = false;
+                AplicarCaraPendiente();
+                if (desatascarAlVolver.exchange(false)) Desatascar(false);
+            });
+        }).detach();
+    }
+
+    // En el hilo principal.
+    void Aplicar(Apariencia destino, bool volviendo)
+    {
+        auto* jugador = RE::PlayerCharacter::GetSingleton();
+        auto* base = jugador ? jugador->GetActorBase() : nullptr;
+        if (!jugador || !base || !destino.raza) {
+            PonerEstado("No encuentro esa raza.");
+            return;
+        }
+        auto* razaActual = jugador->GetRace();
+        // Paso a paso, para saber dónde se queda si el juego se cierra.
+        spdlog::info("{} {} ({:08X}) con piel {:08X}, desde {}", volviendo ? "Volver a" : "Transformar en", destino.raza->GetFormEditorID(),
+                     destino.raza->GetFormID(), destino.piel ? destino.piel->GetFormID() : 0, razaActual ? razaActual->GetFormEditorID() : "?");
+        if (!volviendo && !original && razaActual) {
+            original = CapturarJugador(jugador);
+            GuardarOriginal(*original);
+        }
+        // Las criaturas no tienen primera persona.
+        if (auto* camara = RE::PlayerCamera::GetSingleton()) camara->ForceThirdPerson();
+
+        // Lo pendiente de una transformación anterior ya no vale.
+        caraPendiente.reset();
+        ++numeroDeCambio;
+        const bool mismaRaza = razaActual == destino.raza;
+        if (destino.conCara) {
+            AplicarCara(jugador, destino, mismaRaza);
+        } else {
+            base->skin = destino.piel;
+        }
+        if (mismaRaza) {
+            // Lo mismo que QueueNiNodeUpdate de SKSE: vuelve a montar el modelo y la cabeza.
+            spdlog::info("  misma raza: se recarga el modelo");
+            jugador->DoReset3D(true);
+        } else {
+            if (destino.conCara) caraPendiente = destino;
+            cambioPropio = true;
+            desatascarAlVolver = volviendo;
+            spdlog::info("  llamando a Actor.SetRace");
+            if (!PonerRaza(jugador, destino.raza)) {
+                cambioPropio = false;
+                desatascarAlVolver = false;
+                caraPendiente.reset();
+                PonerEstado("No se pudo llamar a TransformacionesAPI. ¿Está instalado el .pex?");
+                spdlog::error("  DispatchStaticCall falló");
                 return;
             }
-            auto* razaActual = jugador->GetRace();
-            // Paso a paso, para saber dónde se queda si el juego se cierra.
-            spdlog::info("Transformar en {} ({:08X}) con piel {:08X}, desde {} con piel {:08X}", raza->GetFormEditorID(), raza->GetFormID(),
-                         piel ? piel->GetFormID() : 0, razaActual ? razaActual->GetFormEditorID() : "?",
-                         base->skin ? base->skin->GetFormID() : 0);
-            if (!volviendo && razaOriginal == 0 && razaActual) {
-                razaOriginal = razaActual->GetFormID();
-                pielOriginal = base->skin ? base->skin->GetFormID() : 0;
-            }
-            // Las criaturas no tienen primera persona.
-            if (auto* camara = RE::PlayerCamera::GetSingleton()) {
-                spdlog::info("  tercera persona");
-                camara->ForceThirdPerson();
-            }
-            base->skin = piel;
-            const bool mismaRaza = razaActual == raza;
-            spdlog::info(mismaRaza ? "  misma raza: se recarga el modelo" : "  llamando a Actor.SetRace");
-            if (mismaRaza) {
-                // Lo mismo que QueueNiNodeUpdate de SKSE: vuelve a montar el modelo con la piel nueva.
-                jugador->DoReset3D(true);
+            if (caraPendiente) VigilarCambioDeRaza();
+        }
+        if (volviendo) {
+            original.reset();
+            transformado = false;
+            std::error_code error;
+            std::filesystem::remove(RutaOriginal(), error);
+            // Con la misma raza no llega el fin del cambio de raza: se desatasca aquí.
+            if (mismaRaza) Desatascar(false);
+            PonerEstado("Has vuelto a tu aspecto.");
+        } else {
+            transformado = true;
+            PonerEstado(std::format("Ahora eres: {}", destino.raza->GetFormEditorID()));
+        }
+    }
+
+    // Personas: toda su cara. Criaturas: raza y piel.
+    void Transformar(RE::FormID idNpc, RE::FormID idRaza, RE::FormID idPiel)
+    {
+        SKSE::GetTaskInterface()->AddTask([idNpc, idRaza, idPiel]() {
+            auto* raza = RE::TESForm::LookupByID<RE::TESRace>(idRaza);
+            auto* npc = idNpc ? RE::TESForm::LookupByID<RE::TESNPC>(idNpc) : nullptr;
+            Apariencia destino;
+            if (npc && raza && EsHumana(raza)) {
+                destino = DesdeNpc(npc);
             } else {
-                cambioPropio = true;
-                desatascarAlVolver = volviendo;
-                if (!PonerRaza(jugador, raza)) {
-                    cambioPropio = false;
-                    desatascarAlVolver = false;
-                    PonerEstado("No se pudo llamar a TransformacionesAPI. ¿Está instalado el .pex?");
-                    spdlog::error("  DispatchStaticCall falló");
-                    return;
-                }
-                spdlog::info("  llamada enviada");
+                destino.conCara = false;
+                destino.raza = raza;
+                destino.piel = idPiel ? RE::TESForm::LookupByID<RE::TESObjectARMO>(idPiel) : nullptr;
             }
-            if (volviendo) {
-                razaOriginal = 0;
-                pielOriginal = 0;
-                // Con la misma raza no llega el fin del cambio de raza: se desatasca aquí.
-                if (mismaRaza) Desatascar(false);
+            Aplicar(std::move(destino), false);
+        });
+    }
+
+    void Volver()
+    {
+        SKSE::GetTaskInterface()->AddTask([]() {
+            CargarOriginal();
+            if (!original) {
+                PonerEstado("No hay un aspecto original guardado.");
+                return;
             }
-            PonerEstado(volviendo ? "Has vuelto a tu raza." : std::format("Ahora eres: {}", raza->GetFormEditorID()));
+            Aplicar(*original, true);
         });
     }
 
@@ -946,6 +1441,9 @@ namespace
                 SKSE::GetTaskInterface()->AddTask(Vigilar);
                 // Los cambios de raza del juego (hombre lobo, señor vampiro) se dejan en paz.
                 if (cambioPropio.exchange(false)) {
+                    // El cambio de raza puede dejar las partes de la cabeza y las pinturas de la raza
+                    // nueva: la cara se vuelve a poner encima.
+                    SKSE::GetTaskInterface()->AddTask(AplicarCaraPendiente);
                     if (desatascarAlVolver.exchange(false)) {
                         SKSE::GetTaskInterface()->AddTask([]() { Desatascar(false); });
                     } else {
@@ -957,36 +1455,6 @@ namespace
             return RE::BSEventNotifyControl::kContinue;
         }
     };
-
-    // ---- Guardado de la raza y la piel originales en la partida ---------------------------
-    //
-    // Versión 2: raza y piel originales. La 1 solo tenía la raza.
-    void AlGuardar(SKSE::SerializationInterface* a)
-    {
-        if (const auto id = razaOriginal.load(); id != 0 && a->OpenRecord(REGISTRO_RAZA, 2)) {
-            a->WriteRecordData(id);
-            a->WriteRecordData(pielOriginal.load());
-        }
-    }
-
-    void AlCargar(SKSE::SerializationInterface* a)
-    {
-        razaOriginal = 0;
-        pielOriginal = 0;
-        std::uint32_t tipo, version, largo;
-        while (a->GetNextRecordInfo(tipo, version, largo)) {
-            if (tipo != REGISTRO_RAZA) continue;
-            RE::FormID guardada = 0, actual = 0;
-            if (a->ReadRecordData(guardada) && a->ResolveFormID(guardada, actual)) razaOriginal = actual;
-            if (version >= 2 && a->ReadRecordData(guardada) && guardada != 0 && a->ResolveFormID(guardada, actual)) pielOriginal = actual;
-        }
-    }
-
-    void AlRevertir(SKSE::SerializationInterface*)
-    {
-        razaOriginal = 0;
-        pielOriginal = 0;
-    }
 
     // ---- Acciones -------------------------------------------------------------------------
     //
@@ -1085,6 +1553,7 @@ namespace
         enfocarBusqueda = true;
         abierto = true;
         SKSE::GetTaskInterface()->AddTask(CargarAcciones);
+        SKSE::GetTaskInterface()->AddTask(CargarOriginal);
         SKSE::GetTaskInterface()->AddTask([]() {
             if (!abierto) return;
             for (std::uint32_t bit = 0; bit < 12; ++bit) {
@@ -1266,7 +1735,7 @@ namespace
         if (pestana == Pestana::kAcciones) return Ejecutar();
         if (seleccion < 0 || seleccion >= static_cast<int>(filtradas.size())) return;
         const auto& e = entradas[filtradas[seleccion]];
-        CambiarRaza(e.raza, e.piel, false);
+        Transformar(e.npc, e.raza, e.piel);
         Cerrar();
     }
 
@@ -1351,10 +1820,9 @@ namespace
         if (ImGui::Button(pestana == Pestana::kAcciones ? "Ejecutar" : "Transformarme", { 200, 0 }) || (intro && haySeleccion)) Transformarse();
         ImGui::EndDisabled();
         ImGui::SameLine();
-        const auto original = razaOriginal.load();
-        ImGui::BeginDisabled(original == 0);
-        if (ImGui::Button("Volver a mi raza", { 200, 0 })) {
-            CambiarRaza(original, pielOriginal.load(), true);
+        ImGui::BeginDisabled(!transformado);
+        if (ImGui::Button("Volver a mi aspecto", { 200, 0 })) {
+            Volver();
             Cerrar();
         }
         ImGui::EndDisabled();
@@ -1580,12 +2048,6 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse)
     SKSE::Init(skse);
     PrepararRegistro();
     LeerAjustes();
-
-    auto* guardado = SKSE::GetSerializationInterface();
-    guardado->SetUniqueID(ID_GUARDADO);
-    guardado->SetSaveCallback(AlGuardar);
-    guardado->SetLoadCallback(AlCargar);
-    guardado->SetRevertCallback(AlRevertir);
 
     return SKSE::GetMessagingInterface()->RegisterListener(AlRecibirMensaje);
 }

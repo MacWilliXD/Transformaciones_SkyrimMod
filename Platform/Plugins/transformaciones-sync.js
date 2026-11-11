@@ -1,13 +1,12 @@
 "use strict";
-// Transformaciones: avisa al servidor de SkyMP cuando cambia la raza del jugador, para que los
+// Transformaciones: avisa al servidor de SkyMP cuando cambia el aspecto del jugador, para que los
 // demás jugadores lo vean transformado.
 //
 // El cliente de SkyMP solo envía la apariencia al salir del menú de creación de personaje, así
-// que el cambio de raza que hace Transformaciones.dll no le llega a nadie. Este plugin de Skyrim
-// Platform manda el mismo mensaje (UpdateAppearance) que el cliente, cada vez que la raza cambia.
-//
-// La apariencia se envía completa, con la cara y el pelo de siempre: así, al volver a la raza
-// original, el servidor la sigue teniendo entera.
+// que los cambios que hace Transformaciones.dll no le llegan a nadie. Este plugin de Skyrim
+// Platform manda el mismo mensaje (UpdateAppearance) que el cliente cada vez que cambia algo de la
+// apariencia: la raza (criaturas) o la cara entera (personas: sexo, partes de la cabeza, rasgos,
+// pinturas, colores, peso). Al volver, manda el aspecto original completo.
 //
 // La apariencia de SkyMP no lleva la piel (el cuerpo de la criatura: lobo de nieve, cada tipo de
 // draugr...). Va aparte, en un paquete propio que el gamemode del servidor puede leer:
@@ -21,8 +20,8 @@ var MSG_UPDATE_APPEARANCE = 4;
 var ESPERA_TRAS_CONECTAR_MS = 5000;  // a que el cliente aplique la apariencia del servidor
 var INTERVALO_MS = 500;
 
-var razaEnviada = 0;     // la raza que el servidor ya conoce; 0 = aún sin referencia
-var pielEnviada = 0;     // la piel de la base del jugador que el servidor ya conoce
+var aparienciaEnviada = null;  // la apariencia que el servidor ya conoce (en texto); null = aún sin referencia
+var pielEnviada = 0;           // la piel de la base del jugador que el servidor ya conoce
 var idxConectado = -1;   // idx del jugador en el servidor
 var conectadoDesde = 0;
 var ultimaComprobacion = 0;
@@ -85,7 +84,7 @@ function comprobar() {
   var jugador = sp.Game.getPlayer();
   var idx = sp.mpClientPlugin.isConnected() ? idxDelJugador() : -1;
   if (!jugador || idx < 0) {
-    razaEnviada = 0;
+    aparienciaEnviada = null;
     pielEnviada = 0;
     idxConectado = -1;
     return;
@@ -94,31 +93,33 @@ function comprobar() {
   if (idx !== idxConectado) {
     idxConectado = idx;
     conectadoDesde = ahora;
-    razaEnviada = 0;
+    aparienciaEnviada = null;
   }
   var raza = jugador.getRace();
   if (!raza) return;
   var idRaza = raza.getFormID();
   var idPiel = pielDe(jugador);
+  var datos = apariencia(jugador);
+  // SetRace cambia la raza del actor; la de su base puede seguir siendo la original.
+  datos.raceId = idRaza;
+  var texto = JSON.stringify(datos);
 
   // En el menú de creación, la apariencia la envía el propio cliente al cerrarlo.
-  if (sp.Ui.isMenuOpen("RaceSex Menu") || ahora - conectadoDesde < ESPERA_TRAS_CONECTAR_MS || razaEnviada === 0) {
-    razaEnviada = idRaza;
+  if (sp.Ui.isMenuOpen("RaceSex Menu") || ahora - conectadoDesde < ESPERA_TRAS_CONECTAR_MS || aparienciaEnviada === null) {
+    aparienciaEnviada = texto;
     pielEnviada = idPiel;
     return;
   }
-  if (idRaza === razaEnviada && idPiel === pielEnviada) return;
+  if (texto === aparienciaEnviada && idPiel === pielEnviada) return;
 
-  if (idRaza !== razaEnviada) {
-    var datos = apariencia(jugador);
-    // SetRace cambia la raza del actor; la de su base puede seguir siendo la original.
-    datos.raceId = idRaza;
+  if (texto !== aparienciaEnviada) {
     sp.mpClientPlugin.send(JSON.stringify({ t: MSG_UPDATE_APPEARANCE, data: datos, idx: idx }), true);
   }
   var paquete = { customPacketType: "transformacion", raceId: idRaza, skinId: idPiel };
   sp.mpClientPlugin.send(JSON.stringify({ t: MSG_CUSTOM_PACKET, contentJsonDump: JSON.stringify(paquete) }), true);
-  log("Enviado al servidor: raza", idRaza.toString(16), "piel", idPiel.toString(16));
-  razaEnviada = idRaza;
+  log("Enviado al servidor: raza", idRaza.toString(16), "piel", idPiel.toString(16), datos.isFemale ? "mujer" : "hombre",
+      datos.headpartIds.length, "partes de la cabeza");
+  aparienciaEnviada = texto;
   pielEnviada = idPiel;
 }
 
