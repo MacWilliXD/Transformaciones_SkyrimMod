@@ -95,10 +95,27 @@ Lo que ajustes se guarda **por raza** en `Transformaciones.ini`, sección `[Cama
 - **Criaturas que luchan con armas** (draugr y esqueletos, falmer, rieklings, hombre lobo, autómatas enanos): usan el ataque normal del juego, que respeta el arma que lleves.
 - **El resto** (lobo, oso, troll, araña, mudcrab, dragón…) no entiende el ataque del juego. Con ellas:
   - **Clic izquierdo**: un ataque normal de la criatura.
-  - **Clic derecho**: un ataque potente (o uno normal, si no tiene).
+  - **Clic derecho**: un ataque potente. Si la criatura no tiene, o ninguno va hacia esa dirección, otro ataque normal distinto del que daría el clic izquierdo.
+  - **La dirección la dan las teclas de movimiento** que tengas pulsadas al hacer clic (ver abajo).
   - Si no estás en guardia, el primer clic te pone en guardia (como sacar el arma). La tecla de sacar el arma (R) funciona como siempre.
 
-Los ataques salen de la lista de ataques de la raza (la misma que usa la IA), elegidos por su probabilidad. Solo se usan los ataques **de frente**: se quitan los laterales, los de hacia atrás, las embestidas y los golpes de escudo. Si avanzas mientras atacas, se prefieren los ataques "hacia delante".
+Los ataques salen de la lista de ataques de la raza (la misma que usa la IA), elegidos por su probabilidad. Se quitan las embestidas, los ataques a la carrera y los golpes de escudo.
+
+**Ataques por dirección.** Cada ataque tiene un ángulo en sus datos (`attackAngle`, el que usa la IA para atacar según dónde está su objetivo). Al hacer clic, se elige el ataque más cercano a la dirección de las teclas:
+
+| Teclas | Dirección | Dragón, por ejemplo |
+|---|---|---|
+| Ninguna o **W** | De frente | Mordisco (clic derecho: mordisco lateral) |
+| **W + A** / **W + D** | Delante a un lado (±45°) | Mordisco lateral (clic derecho: ala) |
+| **A** / **D** | A un lado (±90°) | Ala (clic derecho: cola lateral) |
+| **S + A** / **S + D** | Atrás a un lado (±135°) | Cola lateral |
+| **S** | Detrás (180°) | Coletazo |
+
+- Se lee la dirección de movimiento que calcula el juego, así que vale igual con las teclas cambiadas o con mando.
+- De frente, si avanzas (W) se prefieren los ataques "hacia delante" (los saltos del lobo o del oso), y si no, los demás.
+- Si la criatura no tiene ataques hacia esa dirección, sale el más cercano: por ejemplo, el oso no tiene ataques hacia atrás, y con **S** da un zarpazo lateral.
+- Algunas razas (lobo, troll) tienen el ángulo a 0 en todos sus ataques. Para ellas se usa el nombre: los `Left`/`Right` cuentan como ±45°.
+- Funciona porque, **con el arma desenfundada, el personaje mira hacia la cámara** y las teclas lo mueven sin girarlo: S es de verdad su espalda. Eso depende de la configuración de TrueDirectionalMovement; si la tuya hace girar al personaje con el arma desenfundada, al mantener S la criatura se dará la vuelta antes de atacar. Con la tecla pulsada, la criatura da también un paso en esa dirección justo antes del ataque.
 
 El plugin decide solo a cuál de los dos grupos pertenece cada criatura, mirando si su comportamiento entiende el ataque del juego.
 

@@ -25,6 +25,7 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <numbers>
 #include <random>
 #include <thread>
 #include <unordered_map>
@@ -992,7 +993,13 @@ namespace
     // Los clics del juego mandan eventos de ataque genéricos (attackStart...) que la mayoría de
     // criaturas no entienden. Cada raza tiene su lista de ataques (los datos de ataque del Creation
     // Kit, la que usa la IA): siendo criatura, el clic izquierdo lanza uno normal y el derecho uno
-    // potente (o normal, si no tiene), elegidos como la IA, por su probabilidad.
+    // potente, elegidos como la IA, por su probabilidad.
+    //
+    // La dirección del ataque la dan las teclas de movimiento pulsadas al hacer clic: ninguna o W,
+    // de frente; A o D, a ese lado; S, hacia atrás; y las diagonales. Se elige el ataque cuyo
+    // ángulo (attackAngle, el dato que usa la IA para atacar según dónde está su objetivo) esté más
+    // cerca. Con el arma desenfundada el personaje mira hacia la cámara y las teclas no lo giran,
+    // así que "S" es de verdad la espalda de la criatura.
     //
     // El control de lucha del juego no se quita: con él quitado el juego obliga a guardar el arma
     // (como en las escenas), y la criatura salía de la guardia nada más entrar. Tampoco hace falta:
@@ -1007,6 +1014,7 @@ namespace
     {
         std::string evento;
         float       probabilidad{ 1.0f };
+        float       angulo{ 0.0f };  // hacia dónde va el golpe: 0 de frente, -90 izquierda, 90 derecha, 180 atrás
     };
 
     std::vector<Ataque> ataquesNormales, ataquesPotentes;
@@ -1015,19 +1023,24 @@ namespace
     int                 intentosGrafo = 0;
     std::atomic<bool>   esCriatura{ false };      // criatura que ataca con los clics del mod
 
-    constexpr float ANGULO_DE_FRENTE = 30.0f;  // el mordisco a un lado del dragón va a 25°
-
-    // Algunas razas (lobo, troll) tienen el ángulo a 0 en todos sus ataques, también en los
-    // laterales: esos se quitan por el nombre, pero solo si quedan otros. Al mudcrab y a la araña
-    // les quedarían solo LeftChop/RightChop, que son golpes de frente con una pinza o la otra.
-    void QuitarLaterales(std::vector<Ataque>& lista)
+    // El ángulo del ataque. Algunas razas (lobo, troll) lo tienen a 0 en todos, también en los que
+    // se llaman AttackLeft/AttackRight: para esas, el nombre da la pista.
+    float AnguloDeAtaque(const std::string& evento, float angulo)
     {
-        const auto lateral = [](const Ataque& a) {
-            const auto m = Minusculas(a.evento);
-            return m.find("left") != std::string::npos || m.find("right") != std::string::npos || m.find("side") != std::string::npos;
-        };
-        if (std::ranges::all_of(lista, lateral)) return;
-        std::erase_if(lista, lateral);
+        if (angulo != 0.0f) return angulo;
+        const auto m = Minusculas(evento);
+        if (m.find("lside") != std::string::npos) return -90.0f;
+        if (m.find("rside") != std::string::npos) return 90.0f;
+        const bool izquierda = m.find("left") != std::string::npos;
+        const bool derecha = m.find("right") != std::string::npos;
+        if (izquierda != derecha) return izquierda ? -45.0f : 45.0f;
+        return 0.0f;
+    }
+
+    float DiferenciaAngular(float a, float b)
+    {
+        const float d = std::fmod(std::abs(a - b), 360.0f);
+        return d > 180.0f ? 360.0f - d : d;
     }
 
     // En el hilo principal. Si la raza no tiene ataques propios, usa los de su raza de datos (ATKR).
@@ -1056,55 +1069,85 @@ namespace
             const std::string evento = datos->event.c_str();
             const auto        minusculas = Minusculas(evento);
             const auto&       d = datos->data;
-            // Las que la IA solo usa en situaciones concretas (embestidas, a la carrera, hacia
-            // atrás) tienen probabilidad 0; los golpes de escudo no son ataques.
+            // Las que la IA solo usa en situaciones concretas (embestidas, a la carrera) tienen
+            // probabilidad 0; los golpes de escudo no son ataques.
             if (evento.empty() || d.attackChance <= 0.0f || d.flags.any(Bandera::kBashAttack, Bandera::kChargeAttack)) continue;
-            if (minusculas.find("lunge") != std::string::npos || minusculas.find("rush") != std::string::npos ||
-                minusculas.find("backward") != std::string::npos) {
-                continue;
-            }
-            // Solo de frente: attackAngle es hacia dónde va el golpe respecto al frente (el oso y el
-            // dragón tienen sus golpes laterales a ±90°, la cola a ±135° y 180°).
-            if (std::abs(d.attackAngle) > ANGULO_DE_FRENTE) continue;
-            (d.flags.any(Bandera::kPowerAttack) ? ataquesPotentes : ataquesNormales).push_back({ evento, d.attackChance });
+            if (minusculas.find("lunge") != std::string::npos || minusculas.find("rush") != std::string::npos) continue;
+            (d.flags.any(Bandera::kPowerAttack) ? ataquesPotentes : ataquesNormales)
+                .push_back({ evento, d.attackChance, AnguloDeAtaque(evento, d.attackAngle) });
         }
-        QuitarLaterales(ataquesNormales);
-        QuitarLaterales(ataquesPotentes);
         const auto lista = [](const std::vector<Ataque>& v) {
             std::string texto;
-            for (const auto& a : v) texto += (texto.empty() ? "" : ", ") + a.evento;
+            for (const auto& a : v) texto += std::format("{}{} {:.0f}°", texto.empty() ? "" : ", ", a.evento, a.angulo);
             return texto.empty() ? "-"s : texto;
         };
         spdlog::info("Ataques de {}: normales [{}], potentes [{}]", raza->GetFormEditorID(), lista(ataquesNormales), lista(ataquesPotentes));
     }
 
-    // Por orden de preferencia: primero uno elegido por probabilidad entre los que encajan con el
-    // movimiento (los "Forward" son para atacar avanzando), y luego los demás, por si la criatura
-    // no acepta el primero en ese momento.
-    std::vector<std::string> OrdenarAtaques(const std::vector<Ataque>& lista, bool avanzando)
+    constexpr float MARGEN_DE_DIRECCION = 15.0f;  // ataques a menos de esto del más cercano cuentan como igual de cerca
+
+    // Por orden de preferencia, para la dirección pedida (en grados, 0 de frente). Primero, uno
+    // elegido por probabilidad entre los más cercanos a esa dirección; de frente se prefieren los
+    // "Forward" si se avanza (W) y los demás si no. Después, el resto por cercanía, por si la
+    // criatura no acepta el primero en ese momento. Con otro, se dejan aparte los más cercanos
+    // (para el clic derecho de las criaturas sin ataques potentes: otro ataque en esa dirección).
+    std::vector<std::string> OrdenarAtaques(const std::vector<Ataque>& lista, float direccion, bool avanzando, bool otro)
     {
         static std::mt19937 azar{ std::random_device{}() };
-        std::vector<const Ataque*> encajan, resto;
-        for (const auto& a : lista) {
-            const bool adelante = Minusculas(a.evento).find("forward") != std::string::npos;
-            (adelante == avanzando ? encajan : resto).push_back(&a);
-        }
-        if (encajan.empty()) std::swap(encajan, resto);
-        std::vector<std::string> orden;
-        while (!encajan.empty()) {
-            float total = 0;
-            for (const auto* a : encajan) total += a->probabilidad;
-            float tirada = std::uniform_real_distribution<float>(0.0f, total)(azar);
-            std::size_t elegido = 0;
-            for (; elegido + 1 < encajan.size(); ++elegido) {
-                tirada -= encajan[elegido]->probabilidad;
-                if (tirada <= 0) break;
+        std::vector<const Ataque*> todos;
+        for (const auto& a : lista) todos.push_back(&a);
+        std::ranges::sort(todos, {}, [&](const Ataque* a) { return DiferenciaAngular(a->angulo, direccion); });
+        if (todos.empty()) return {};
+
+        const auto cercanos = [&](std::size_t desde) {
+            const float mejor = DiferenciaAngular(todos[desde]->angulo, direccion);
+            std::size_t hasta = desde;
+            while (hasta < todos.size() && DiferenciaAngular(todos[hasta]->angulo, direccion) <= mejor + MARGEN_DE_DIRECCION) ++hasta;
+            return hasta;
+        };
+        std::size_t desde = 0;
+        if (otro) {
+            const auto primeros = cercanos(0);
+            if (primeros < todos.size()) {
+                std::rotate(todos.begin(), todos.begin() + primeros, todos.end());
             }
-            orden.push_back(encajan[elegido]->evento);
-            encajan.erase(encajan.begin() + elegido);
         }
-        for (const auto* a : resto) orden.push_back(a->evento);
+        const auto hasta = cercanos(desde);
+        std::vector<const Ataque*> grupo(todos.begin() + desde, todos.begin() + hasta);
+        if (DiferenciaAngular(direccion, 0.0f) < 30.0f) {
+            std::vector<const Ataque*> encajan;
+            for (const auto* a : grupo) {
+                if ((Minusculas(a->evento).find("forward") != std::string::npos) == avanzando) encajan.push_back(a);
+            }
+            if (!encajan.empty()) grupo = encajan;
+        }
+        float total = 0;
+        for (const auto* a : grupo) total += a->probabilidad;
+        float tirada = std::uniform_real_distribution<float>(0.0f, total)(azar);
+        const Ataque* elegido = grupo.back();
+        for (const auto* a : grupo) {
+            tirada -= a->probabilidad;
+            if (tirada <= 0) {
+                elegido = a;
+                break;
+            }
+        }
+        std::vector<std::string> orden{ elegido->evento };
+        for (const auto* a : todos) {
+            if (a != elegido) orden.push_back(a->evento);
+        }
         return orden;
+    }
+
+    // La dirección de las teclas de movimiento (la que calcula el juego, así vale con teclas
+    // cambiadas o mando): 0 de frente, -90 izquierda, 90 derecha, 180 atrás. Sin teclas, de frente.
+    float DireccionDeTeclas()
+    {
+        auto* controles = RE::PlayerControls::GetSingleton();
+        if (!controles) return 0.0f;
+        const auto& v = controles->data.moveInputVec;
+        if (std::hypot(v.x, v.y) < 0.2f) return 0.0f;
+        return std::atan2(v.x, v.y) * 180.0f / std::numbers::pi_v<float>;
     }
 
     // El contexto de entrada de arriba de la pila (0: jugando). Con un menú del juego abierto
@@ -1200,16 +1243,26 @@ namespace
             jugador->DrawWeaponMagicHands(true);
             return;
         }
-        const auto& lista = potente && !ataquesPotentes.empty() ? ataquesPotentes : ataquesNormales;
+        const float direccion = DireccionDeTeclas();
+        const bool  avanzando = jugador->AsActorState()->actorState1.movingForward;
+        // Clic derecho: un ataque potente en esa dirección. Si no tiene potentes, o ninguno va hacia
+        // esa dirección (los potentes suelen ser todos de frente), otro ataque normal distinto del
+        // que daría el clic izquierdo.
+        bool usarPotentes = potente && !ataquesPotentes.empty();
+        if (usarPotentes) {
+            float mejor = 360.0f;
+            for (const auto& a : ataquesPotentes) mejor = std::min(mejor, DiferenciaAngular(a.angulo, direccion));
+            usarPotentes = mejor <= 60.0f;
+        }
+        const auto& lista = usarPotentes ? ataquesPotentes : ataquesNormales;
         if (lista.empty()) return;
-        const bool avanzando = jugador->AsActorState()->actorState1.movingForward;
-        for (const auto& evento : OrdenarAtaques(lista, avanzando)) {
+        for (const auto& evento : OrdenarAtaques(lista, direccion, avanzando, potente && !usarPotentes)) {
             if (jugador->NotifyAnimationGraph(RE::BSFixedString(evento.c_str()))) {
-                spdlog::info("Ataque {}: {}", potente ? "potente" : "normal", evento);
+                spdlog::info("Ataque {} hacia {:.0f}°: {}", potente ? "potente" : "normal", direccion, evento);
                 return;
             }
         }
-        spdlog::info("Ataque {}: la criatura no aceptó ninguno ahora", potente ? "potente" : "normal");
+        spdlog::info("Ataque {} hacia {:.0f}°: la criatura no aceptó ninguno ahora", potente ? "potente" : "normal", direccion);
     }
 
     // En el hilo principal, varias veces por segundo: mantiene la lista de ataques según la raza.
