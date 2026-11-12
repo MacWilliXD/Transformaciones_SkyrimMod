@@ -4,7 +4,7 @@ Menú de administración para Skyrim Special Edition (pensado para servidores de
 
 Se abre con **F11** y tiene un buscador con todos los NPC cargados. Al elegir una criatura, el jugador pasa a tener su raza y su piel, con sus animaciones, y puede moverse, atacar y lanzar sus acciones. Al elegir una persona, el jugador pasa a tener su cara y su cuerpo: sexo, raza, rasgos, pelo, pinturas, color de piel, peso y altura. La ropa no se copia.
 
-> Estado: en pruebas. Funciona en el juego local; la sincronización con los demás jugadores necesita el código del servidor de [`servidor/`](#lo-que-necesita-el-servidor-de-skymp), que aún no se ha probado en un servidor real.
+> Estado: en pruebas. Con el servidor de Aestherius, las transformaciones en personas se ven en todos; las de criaturas están pendientes de probar con el modo servidor.
 
 ## Contenido del repositorio
 
@@ -14,9 +14,9 @@ Se abre con **F11** y tiene un buscador con todos los NPC cargados. Al elegir un
 | `src/PCH.h` | Cabecera precompilada (CommonLibSSE y la biblioteca estándar) |
 | `Scripts/Source/TransformacionesAPI.psc` | Script de Papyrus que hace el cambio de raza (`Actor.SetRace`) y el desatasco. El plugin lo llama directamente |
 | `Scripts/TransformacionesAPI.pex` | El script compilado |
-| `Platform/Plugins/transformaciones-sync.js` | Plugin de Skyrim Platform (el entorno de JavaScript del cliente de SkyMP) que avisa al servidor cuando cambia el aspecto del jugador (raza, cara o piel) |
-| `servidor/transformaciones-gamemode.js` | Código para el **gamemode del servidor** de SkyMP, para que todos vean al jugador transformado. No va en el cliente |
-| `Transformaciones.ini` | Ajustes: la tecla del menú y las razas que no se muestran. El plugin guarda aquí también la cámara de cada criatura |
+| `Platform/Plugins/transformaciones-sync.js` | Plugin de Skyrim Platform (el entorno de JavaScript del cliente de SkyMP) que lleva al servidor las peticiones del menú (transformarse y volver) |
+| `servidor/transformaciones.ts` | Módulo para el **gamemode del servidor** de Aestherius (SkyMP), para que todos vean al admin transformado. No va en el cliente |
+| `Transformaciones.ini` | Ajustes: la tecla del menú, el modo (servidor o local) y las razas que no se muestran. El plugin guarda aquí también la cámara de cada criatura |
 | `CMakeLists.txt`, `CMakePresets.json` | Compilación con CMake y Ninja |
 | `vcpkg.json`, `vcpkg-configuration.json` | Dependencias: CommonLibSSE-NG e ImGui (con DirectX 11) |
 | `compilar.ps1` | Compila todo, rehace el paquete y, con `-Instalar`, lo copia al juego |
@@ -70,14 +70,14 @@ La cara se genera al momento con los datos del NPC, igual que la del jugador. Lo
 
 | Botón | Qué hace |
 |---|---|
-| **Transformarme** (o doble clic, o Intro) | Te convierte en el NPC elegido |
+| **Transformarme** (o doble clic, o Intro) | Te convierte en el NPC elegido. En modo servidor, se lo pide al servidor |
 | **Volver a mi aspecto** | Te devuelve tu aspecto original completo (raza, piel, cara y cuerpo) y te desatasca. Ver [Aspecto original](#aspecto-original) |
 | **Desatascar** | Para cuando el personaje se queda sin control: devuelve los controles, quita el control por IA, la parálisis y el bloqueo de movimiento, y vuelve a la postura de pie |
 | **Cerrar** | Cierra el menú |
 
 ### Aspecto original
 
-Antes de la primera transformación, el plugin guarda tu aspecto completo en `Data/SKSE/Plugins/Transformaciones/<nombre del personaje>.txt`. Puedes transformarte en varios NPC seguidos: al volver, siempre recuperas el aspecto que tenías antes de la primera transformación. Después, el archivo se borra.
+En modo servidor, el aspecto original lo guarda el servidor (ver [la parte del servidor](#lo-que-necesita-el-servidor-de-skymp)). En modo local, antes de la primera transformación el plugin guarda tu aspecto completo en `Data/SKSE/Plugins/Transformaciones/<nombre del personaje>.txt`. Puedes transformarte en varios NPC seguidos: al volver, siempre recuperas el aspecto que tenías antes de la primera transformación. Después, el archivo se borra.
 
 Va en un archivo y no en la partida porque SkyMP no usa las partidas guardadas: así aguanta reconexiones y cierres del juego. **No lo borres mientras estés transformado**, o no habrá a qué volver.
 
@@ -136,6 +136,10 @@ Ejemplo con todas las secciones:
 ; Tecla del menú, en código DIK decimal. 87 = F11. No uses 67 (F9): carga la partida rápida.
 Tecla=87
 
+[Servidor]
+; 1: el menú le pide la transformación al servidor (por defecto). 0: te transforma en tu juego, sin servidor.
+Modo=1
+
 [Ocultar]
 ; Razas que no salen en el menú, por su EditorID, separadas por comas.
 Razas=ChickenRace, HareRace
@@ -162,42 +166,41 @@ El plugin escribe en `Documentos\My Games\<carpeta del juego>\SKSE\Transformacio
 
 ## Lo que necesita el servidor de SkyMP
 
-Por defecto, **los demás jugadores no ven la transformación**. El cliente de SkyMP solo envía la apariencia del jugador al cerrar el menú de creación de personaje, y el servidor descarta cualquier cambio de apariencia que llegue fuera de ese menú.
+En **modo servidor** (`[Servidor] Modo=1`, por defecto) el menú no transforma al jugador: le pide la transformación al servidor, y el servidor la aplica a todos, también a quien la pide. Así, lo que ves en tu juego es lo que el servidor ha aceptado, igual que lo ven los demás, y se puede comprobar si funciona sin otro jugador delante.
 
-### Qué hace ya el cliente
+Solo necesita el mod **quien se transforma**. Los demás no tienen que instalar nada.
 
-`transformaciones-sync.js` comprueba dos veces por segundo el aspecto del jugador, y cuando cambia avisa al servidor:
+### Qué hace el cliente
 
-1. **Si cambia la apariencia, la apariencia completa** (mensaje `UpdateAppearance`, el mismo que usa SkyMP): raza, sexo, peso, colores, partes de la cabeza, rasgos, preajustes y pinturas. Con una persona, eso es toda su cara, así que en el cliente **para las personas no hace falta nada más** (en el servidor sí: ver abajo). Al volver, se envía el aspecto original completo.
-2. **Siempre, un paquete propio con la raza y la piel**, porque la apariencia de SkyMP no incluye la piel:
-   ```json
-   { "customPacketType": "transformacion", "raceId": 123456, "skinId": 654321 }
-   ```
-   `skinId` es `0` cuando se usa la piel de la raza (por ejemplo, al volver a la propia).
+Al pulsar **Transformarme** o **Volver a mi aspecto**, `Transformaciones.dll` manda un ModEvent (`Transformaciones_Peticion`, con un JSON) y `transformaciones-sync.js` lo envía al servidor como paquete propio:
 
-### Qué falta en el servidor
+```json
+{ "customPacketType": "transformacion", "version": 4, "accion": "persona", "apariencia": { "...": "..." } }
+{ "customPacketType": "transformacion", "version": 4, "accion": "criatura", "raceId": 78346, "skinId": 0 }
+{ "customPacketType": "transformacion", "version": 4, "accion": "volver" }
+```
 
-**No hay que modificar ni recompilar SkyMP.** Solo hay que añadir al **gamemode** (el JavaScript del servidor) el contenido de [`servidor/transformaciones-gamemode.js`](servidor/transformaciones-gamemode.js), pegándolo o cargándolo con `require` desde el gamemode. Hace tres cosas:
+- `apariencia` es la cara completa del NPC con la estructura de SkyMP: sexo, raza, peso, colores, partes de la cabeza, rasgos, preajustes y pinturas.
+- `skinId` es la piel de la criatura (el cuerpo: lobo de nieve, cada tipo de draugr…). `0` es la de su raza.
+- Si no estás conectado a un servidor, el `.js` lo avisa en pantalla. Para probar sin servidor, `Modo=0`: el mod te transforma en tu juego, como antes, y nadie más lo ve.
 
-1. **Raza:** con `mp.onUpdateAppearanceAttempt`, SkyMP avisa al gamemode de los cambios de apariencia que ha descartado. Si viene de un admin, el código la aplica con `mp.set(actorId, "appearance", appearance)`, y el servidor la reenvía a los jugadores cercanos. Si el gamemode ya tenía su propio `onUpdateAppearanceAttempt`, se sigue llamando.
-2. **Piel:** escucha el paquete propio con `mp.on("customPacket", ...)` y guarda la piel en una propiedad del actor, `transformacionesPiel`.
-3. **Mostrar la piel a los demás:** la propiedad se crea con `mp.makeProperty`, junto con un código que el servidor manda a los clientes. En el juego de cada jugador cercano, ese código pone la piel en el modelo del transformado y recarga su 3D. Por eso los demás no necesitan el mod.
+### Qué hace el servidor
 
-Qué parte hace falta para cada caso:
+[`servidor/transformaciones.ts`](servidor/transformaciones.ts) es un módulo para el gamemode de Aestherius (`aestherius-gamemode/src`). **No hay que modificar ni recompilar SkyMP.** Se conecta en `index.ts` con `iniciarTransformaciones()` al arrancar y `alEntrarTransformaciones(profileId)` cuando entra un jugador.
 
-| Transformación | Lo que necesita del gamemode | Por qué |
-|---|---|---|
-| **Persona** | Solo la 1 (raza) | La apariencia de SkyMP ya es su cara completa. El servidor la reenvía y cada jugador la aplica con el sistema normal de SkyMP, el mismo que usa para cualquier personaje |
-| **Criatura** | La 1, la 2 y la 3 | La apariencia lleva la raza, pero no la piel, que es lo que distingue un lobo de nieve de un lobo normal o un tipo de draugr de otro |
-| **Volver** | La 1, y la 2 para quitar la piel de criatura | Se envía el aspecto original completo y la piel `0` |
+1. **Permiso:** mira el rol de la cuenta en la base de datos. Solo `admin` y `superadmin`; a los demás se les avisa y no pasa nada.
+2. **Personas:** guarda la apariencia original del personaje y pone la nueva con `mp.set(actorId, "appearance", ...)`. SkyMP la reparte a todos, y el cliente de cada uno la aplica con su sistema normal de caras, también al propio admin. El nombre no cambia.
+3. **Criaturas:** la apariencia no se toca. La raza y la piel van en la propiedad `transformacionesCriatura`, creada con `mp.makeProperty` junto con un código que el servidor manda a los clientes: en el juego del admin (`updateOwner`) y en el de cada jugador cercano (`updateNeighbor`) pone la piel y cambia la raza con `SetRace`, y al volver pone las suyas.
+4. **Volver:** pone la apariencia guardada y quita la criatura. También al entrar al servidor, por si alguien salió transformado.
+5. **Registro:** cada transformación y cada vuelta quedan en la tabla `registro` como `admin_transformar`.
 
-Está preparado para que recargar el gamemode no duplique los manejadores. Los nombres de la API (`mp.onUpdateAppearanceAttempt`, `mp.on("customPacket")`, `mp.makeProperty`, `mp.getUserActor`, `mp.set`) están comprobados en el código público de SkyMP.
+### Mods
 
-### Antes de ponerlo en marcha
+Valen las razas, pieles y partes de la cabeza de cualquier mod: con el launcher de Aestherius todos los jugadores cargan los plugins en el mismo orden que el servidor, así que los números coinciden. Solo la raza de una persona necesita un arreglo: si el servidor no tiene esa raza (un `.esl`, que no carga), guardarla como raza impediría entrar al personaje. Se guarda la nórdica y la de verdad va delante de las partes de la cabeza, como hace el creador de personajes del servidor, y el cliente la saca de ahí.
 
-- **Conectar `esAdmin(actorId)`** con el sistema de admins del gamemode. Ahora devuelve `false`, así que **nadie** puede transformarse hasta que se cambie. Sin esa comprobación, cualquiera con el mod podría transformarse en el servidor.
-- **Mismos mods y mismo orden de carga** en todos los jugadores: las razas, pieles y partes de la cabeza de mods se identifican por su FormID, que depende del orden de carga. Si un admin se transforma en un NPC de un mod (o en una persona con pelo o cara de un mod), los demás necesitan ese mod. Las del juego base valen para todos.
-- **Probarlo en un servidor de pruebas.** Este código no se ha probado todavía en un servidor real.
+### Avisos de prueba
+
+Mientras se prueba, el código de las criaturas muestra un aviso en la pantalla de cada uno («Transformaciones: tú: criatura 1320a…», «otro: …», o el error si falla). Se apagan con `TF_AVISOS = false` en el módulo. El código que se manda a los clientes solo cambia **al reiniciar el servidor**, no al desplegar el gamemode.
 
 ### Lo que no se sincroniza (o no se sabe aún)
 

@@ -1,135 +1,97 @@
 "use strict";
-// Transformaciones: avisa al servidor de SkyMP cuando cambia el aspecto del jugador, para que los
-// demás jugadores lo vean transformado.
+// Transformaciones: lleva al servidor de SkyMP las peticiones del menú (F11).
 //
-// El cliente de SkyMP solo envía la apariencia al salir del menú de creación de personaje, así
-// que los cambios que hace Transformaciones.dll no le llegan a nadie. Este plugin de Skyrim
-// Platform manda el mismo mensaje (UpdateAppearance) que el cliente cada vez que cambia algo de la
-// apariencia: la raza (criaturas) o la cara entera (personas: sexo, partes de la cabeza, rasgos,
-// pinturas, colores, peso). Al volver, manda el aspecto original completo.
+// En modo servidor ([Servidor] Modo=1 de Transformaciones.ini) el menú no transforma al jugador: Transformaciones.dll
+// manda un ModEvent «Transformaciones_Peticion» con un JSON, y este plugin lo envía al servidor como paquete propio:
+//   { customPacketType: "transformacion", version: 4, accion: "persona", apariencia }   (la cara completa del NPC)
+//   { customPacketType: "transformacion", version: 4, accion: "criatura", raceId, skinId }
+//   { customPacketType: "transformacion", version: 4, accion: "volver" }
+// El servidor comprueba el permiso y lo aplica a todos los jugadores, también a quien lo pide: lo que se ve en el
+// propio juego es lo que ha aceptado el servidor, igual que lo ven los demás. Ver servidor/transformaciones.ts.
 //
-// La apariencia de SkyMP no lleva la piel (el cuerpo de la criatura: lobo de nieve, cada tipo de
-// draugr...). Va aparte, en un paquete propio que el gamemode del servidor puede leer:
-//   { customPacketType: "transformacion", raceId, skinId }   (skinId 0: la piel de la raza)
-// Ver servidor/transformaciones-gamemode.js.
+// En modo local (Modo=0) la DLL transforma al jugador ella misma y este plugin no hace nada.
 
 var sp = globalThis.skyrimPlatform;
 
 var MSG_CUSTOM_PACKET = 1;
-var MSG_UPDATE_APPEARANCE = 4;
-var ESPERA_TRAS_CONECTAR_MS = 5000;  // a que el cliente aplique la apariencia del servidor
-var INTERVALO_MS = 500;
+var EVENTO = "Transformaciones_Peticion";
+var ACCIONES = { persona: true, criatura: true, volver: true };
 
-var aparienciaEnviada = null;  // la apariencia que el servidor ya conoce (en texto); null = aún sin referencia
-var pielEnviada = 0;           // la piel de la base del jugador que el servidor ya conoce
-var idxConectado = -1;   // idx del jugador en el servidor
-var conectadoDesde = 0;
-var ultimaComprobacion = 0;
+// También a Data/Platform/Logs/Transformaciones-logs.txt (el mismo archivo que el código del servidor).
+function anotar(texto) {
+  try {
+    sp.writeLogs("Transformaciones", new Date().toISOString() + " plugin: " + texto);
+  } catch (e) {
+    // sin archivo
+  }
+}
 
 function log() {
   var args = ["[Transformaciones]"].concat(Array.prototype.slice.call(arguments));
   sp.printConsole.apply(null, args);
+  anotar(Array.prototype.slice.call(arguments).join(" "));
 }
 
-// El cliente de SkyMP guarda su modelo del mundo en storage, que comparten todos los plugins.
-function idxDelJugador() {
-  var mundo = sp.storage["worldModel"];
-  if (!mundo || typeof mundo !== "object" || !mundo.forms) return -1;
-  var form = mundo.forms[mundo.playerCharacterFormIdx];
-  return form && typeof form.idx === "number" ? form.idx : -1;
-}
-
-// La piel puesta en la base del jugador (Transformaciones.dll pone la del NPC); 0 si no tiene.
-function pielDe(actor) {
-  var piel = sp.ActorBase.from(actor.getBaseObject()).getSkin();
-  return piel ? piel.getFormID() : 0;
-}
-
-// Igual que getAppearance del cliente de SkyMP.
-function apariencia(actor) {
-  var base = sp.ActorBase.from(actor.getBaseObject());
-  var pelo = base.getHairColor();
-  var piel = sp.TESModPlatform.getSkinColor(base);
-  var a = {
-    isFemale: base.getSex() === 1,
-    raceId: base.getRace() ? base.getRace().getFormID() : 0,
-    weight: base.getWeight(),
-    hairColor: pelo ? pelo.getColor() : 0,
-    headpartIds: [],
-    headTextureSetId: base.getFaceTextureSet() ? base.getFaceTextureSet().getFormID() : 0,
-    options: new Array(19),
-    presets: new Array(4),
-    tints: [],
-    skinColor: piel ? piel.getColor() : 0,
-    name: actor.getBaseObject().getName(),
-  };
-  var i;
-  for (i = 0; i < base.getNumHeadParts(); ++i) {
-    var parte = base.getNthHeadPart(i);
-    if (parte) a.headpartIds.push(parte.getFormID());
-  }
-  for (i = 0; i < a.options.length; ++i) a.options[i] = base.getFaceMorph(i);
-  for (i = 0; i < a.presets.length; ++i) a.presets[i] = base.getFacePreset(i);
-  for (i = 0; i < sp.Game.getNumTintMasks(); ++i) {
-    a.tints.push({
-      texturePath: sp.Game.getNthTintMaskTexturePath(i),
-      type: sp.Game.getNthTintMaskType(i),
-      argb: sp.Game.getNthTintMaskColor(i),
-    });
-  }
-  return a;
-}
-
-function comprobar() {
-  var jugador = sp.Game.getPlayer();
-  var idx = sp.mpClientPlugin.isConnected() ? idxDelJugador() : -1;
-  if (!jugador || idx < 0) {
-    aparienciaEnviada = null;
-    pielEnviada = 0;
-    idxConectado = -1;
-    return;
-  }
-  var ahora = Date.now();
-  if (idx !== idxConectado) {
-    idxConectado = idx;
-    conectadoDesde = ahora;
-    aparienciaEnviada = null;
-  }
-  var raza = jugador.getRace();
-  if (!raza) return;
-  var idRaza = raza.getFormID();
-  var idPiel = pielDe(jugador);
-  var datos = apariencia(jugador);
-  // SetRace cambia la raza del actor; la de su base puede seguir siendo la original.
-  datos.raceId = idRaza;
-  var texto = JSON.stringify(datos);
-
-  // En el menú de creación, la apariencia la envía el propio cliente al cerrarlo.
-  if (sp.Ui.isMenuOpen("RaceSex Menu") || ahora - conectadoDesde < ESPERA_TRAS_CONECTAR_MS || aparienciaEnviada === null) {
-    aparienciaEnviada = texto;
-    pielEnviada = idPiel;
-    return;
-  }
-  if (texto === aparienciaEnviada && idPiel === pielEnviada) return;
-
-  if (texto !== aparienciaEnviada) {
-    sp.mpClientPlugin.send(JSON.stringify({ t: MSG_UPDATE_APPEARANCE, data: datos, idx: idx }), true);
-  }
-  var paquete = { customPacketType: "transformacion", raceId: idRaza, skinId: idPiel };
-  sp.mpClientPlugin.send(JSON.stringify({ t: MSG_CUSTOM_PACKET, contentJsonDump: JSON.stringify(paquete) }), true);
-  log("Enviado al servidor: raza", idRaza.toString(16), "piel", idPiel.toString(16), datos.isFemale ? "mujer" : "hombre",
-      datos.headpartIds.length, "partes de la cabeza");
-  aparienciaEnviada = texto;
-  pielEnviada = idPiel;
-}
-
-sp.on("update", function () {
-  var ahora = Date.now();
-  if (ahora - ultimaComprobacion < INTERVALO_MS) return;
-  ultimaComprobacion = ahora;
+function razaDelJugador() {
   try {
-    comprobar();
+    var r = sp.Game.getPlayer().getRace();
+    return r ? r.getFormID().toString(16) : "?";
   } catch (e) {
-    log("Error:", e && e.message ? e.message : String(e));
+    return "?";
+  }
+}
+
+// Aviso en la esquina de la pantalla: en este servidor la consola no la puede abrir todo el mundo.
+function avisar(texto) {
+  log(texto);
+  try {
+    sp.Debug.notification("Transformaciones: " + texto);
+  } catch (e) {
+    // sin avisos en pantalla
+  }
+}
+
+function alPedir(e) {
+  if (!e || e.eventName !== EVENTO) return;
+  var peticion;
+  try {
+    peticion = JSON.parse(String(e.strArg));
+  } catch (err) {
+    avisar("la petición del menú no se entiende");
+    return;
+  }
+  if (!peticion || !ACCIONES[peticion.accion]) return;
+  if (!sp.mpClientPlugin.isConnected()) {
+    avisar("no estás conectado a un servidor (para probar sin servidor, pon Modo=0 en Transformaciones.ini)");
+    return;
+  }
+  peticion.customPacketType = "transformacion";
+  peticion.version = 4;
+  sp.mpClientPlugin.send(JSON.stringify({ t: MSG_CUSTOM_PACKET, contentJsonDump: JSON.stringify(peticion) }), true);
+  if (peticion.accion === "volver") avisar("pedido al servidor volver a tu aspecto");
+  else avisar("transformación pedida al servidor (" + peticion.accion + ")");
+  // transformaciones5: si a los 6 s no ha cambiado nada, el código del servidor no ha llegado a este juego.
+  var antes = razaDelJugador();
+  anotar("petición " + JSON.stringify({ accion: peticion.accion, raceId: peticion.raceId, skinId: peticion.skinId }) + ", raza antes " + antes);
+  var hasta = Date.now() + 6000;
+  var vigilar = sp.on("update", function () {
+    if (Date.now() < hasta) return;
+    hasta = Infinity; // aunque no se pueda quitar el manejador, ya no vuelve a anotar
+    try {
+      sp.unsubscribe(vigilar);
+    } catch (err) {
+      // versión de Skyrim Platform sin unsubscribe
+    }
+    anotar("6 s después de pedir " + peticion.accion + ": raza " + razaDelJugador() + " (antes " + antes + ")");
+  });
+}
+
+sp.on("modEvent", function (e) {
+  try {
+    alPedir(e);
+  } catch (err) {
+    log("Error:", err && err.message ? err.message : String(err));
   }
 });
+
+log("plugin de peticiones v5 cargado");

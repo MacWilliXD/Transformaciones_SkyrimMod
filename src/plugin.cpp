@@ -1,9 +1,9 @@
 // Transformaciones: un menú de administración para convertirse en cualquier personaje o criatura.
 //
 // Con la tecla configurada (F11 por defecto) se abre una ventana con un buscador de todos los
-// NPC cargados. Al elegir uno, el jugador pasa a la raza de ese NPC con el mismo comando que la
-// consola: `setrace`. "Volver a mi raza" deshace el cambio; la raza original se guarda en la
-// partida.
+// NPC cargados. En modo servidor (por defecto) el menú solo pide la transformación al servidor de
+// SkyMP, que la aplica a todos; en modo local, el jugador pasa a la raza (Actor.SetRace) y la cara
+// de ese NPC aquí mismo, y "Volver a mi aspecto" lo deshace con el aspecto guardado en un archivo.
 //
 // La ventana se dibuja con ImGui enganchado al Present de DirectX. El ratón y el teclado se leen
 // de los eventos de entrada del propio juego, y mientras está abierta se desactivan los controles
@@ -37,6 +37,12 @@ namespace
     constexpr std::uint32_t TECLA_POR_DEFECTO = 0x57;  // F11
 
     std::uint32_t tecla = TECLA_POR_DEFECTO;
+
+    // Modo servidor ([Servidor] Modo=1 del .ini, por defecto): el menú no transforma al jugador, solo pide la
+    // transformación al servidor de SkyMP (por transformaciones-sync.js). El servidor la aplica a todos, también a
+    // este jugador, así que lo que se ve es lo mismo que ven los demás. Con Modo=0 se transforma aquí mismo, sin
+    // servidor (para probar sin conectarse).
+    bool modoServidor = true;
 
     // ---- Texto ----------------------------------------------------------------------------
 
@@ -958,9 +964,112 @@ namespace
         }
     }
 
+    // ---- Modo servidor -------------------------------------------------------------------
+    //
+    // La petición va en un ModEvent («Transformaciones_Peticion», con un JSON en el texto) que recoge
+    // transformaciones-sync.js y manda al servidor. Las personas van con la apariencia de SkyMP (los mismos campos que
+    // su getAppearance); las criaturas, con la raza y la piel. Los números son los de este juego: con el launcher de
+    // Aestherius todos los jugadores cargan los plugins en el mismo orden, así que valen también los de los mods.
+
+    std::string TextoJson(std::string_view s)
+    {
+        std::string r = "\"";
+        for (const char c : s) {
+            switch (c) {
+            case '"': r += "\\\""; break;
+            case '\\': r += "\\\\"; break;
+            case '\n': r += "\\n"; break;
+            case '\r': r += "\\r"; break;
+            case '\t': r += "\\t"; break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) r += std::format("\\u{:04x}", static_cast<unsigned char>(c));
+                else r += c;
+            }
+        }
+        return r + "\"";
+    }
+
+    std::string NumeroJson(float x) { return std::isfinite(x) ? std::format("{}", x) : "0"; }
+
+    std::uint32_t Rgb(RE::Color c) { return (std::uint32_t{ c.red } << 16) | (std::uint32_t{ c.green } << 8) | c.blue; }
+
+    // Como getAppearance de SkyMP: colores en RGB, pinturas en ARGB (alfa = intensidad).
+    std::string AparienciaJson(const Apariencia& a)
+    {
+        std::string j = std::format(R"({{"isFemale":{},"raceId":{},"weight":{},)", a.mujer ? "true" : "false", a.raza ? a.raza->GetFormID() : 0,
+                                    NumeroJson(a.peso));
+        const auto pelo = a.colorPelo ? std::optional<RE::Color>{ a.colorPelo->color } : a.valorColorPelo;
+        j += std::format(R"("hairColor":{},"skinColor":{},"headTextureSetId":{},"headpartIds":[)", pelo ? Rgb(*pelo) : 0, Rgb(a.colorPiel),
+                         a.texturaCara ? a.texturaCara->GetFormID() : 0);
+        for (std::size_t i = 0; i < a.partes.size(); ++i) j += std::format("{}{}", i ? "," : "", a.partes[i]->GetFormID());
+        j += R"(],"options":[)";
+        for (std::size_t i = 0; i < a.rasgos.size(); ++i) j += (i ? "," : "") + NumeroJson(a.rasgos[i]);
+        j += R"(],"presets":[)";
+        for (std::size_t i = 0; i < a.preajustes.size(); ++i) j += std::format("{}{}", i ? "," : "", a.preajustes[i]);
+        j += R"(],"tints":[)";
+        bool primero = true;
+        for (const auto* t : PinturasVisibles(a.tintes)) {
+            const auto alfa = static_cast<std::uint32_t>(std::clamp(t->alfa, 0.0f, 1.0f) * 255.0f + 0.5f);
+            j += std::format(R"({}{{"texturePath":{},"type":{},"argb":{}}})", primero ? "" : ",", TextoJson(t->ruta), t->tipo, (alfa << 24) | Rgb(t->color));
+            primero = false;
+        }
+        return j + "]}";
+    }
+
+    // En el hilo principal.
+    void EnviarPeticion(const std::string& json)
+    {
+        auto* fuente = SKSE::GetModCallbackEventSource();
+        if (!fuente) {
+            PonerEstado("No se pudo avisar a transformaciones-sync.js.");
+            spdlog::error("Sin ModCallbackEventSource: la petición no sale");
+            return;
+        }
+        SKSE::ModCallbackEvent evento{ "Transformaciones_Peticion", RE::BSFixedString(json.c_str()), 0.0f, RE::PlayerCharacter::GetSingleton() };
+        fuente->SendEvent(&evento);
+        spdlog::info("Petición al servidor ({} bytes)", json.size());
+    }
+
+    void PedirTransformacion(RE::FormID idNpc, RE::FormID idRaza, RE::FormID idPiel)
+    {
+        SKSE::GetTaskInterface()->AddTask([idNpc, idRaza, idPiel]() {
+            auto* raza = RE::TESForm::LookupByID<RE::TESRace>(idRaza);
+            auto* npc = idNpc ? RE::TESForm::LookupByID<RE::TESNPC>(idNpc) : nullptr;
+            if (!raza) {
+                PonerEstado("No encuentro esa raza.");
+                return;
+            }
+            if (npc && EsHumana(raza)) {
+                spdlog::info("Pedir al servidor: persona {:08X} ({})", idNpc, raza->GetFormEditorID());
+                EnviarPeticion(std::format(R"({{"accion":"persona","apariencia":{}}})", AparienciaJson(DesdeNpc(npc))));
+            } else {
+                spdlog::info("Pedir al servidor: criatura {} ({:08X}) con piel {:08X}", raza->GetFormEditorID(), idRaza, idPiel);
+                // Las criaturas no tienen primera persona.
+                if (auto* camara = RE::PlayerCamera::GetSingleton()) camara->ForceThirdPerson();
+                cambioPropio = true;  // el fin del cambio de raza que hará el servidor es nuestro (registro del estado)
+                desatascarAlVolver = false;
+                EnviarPeticion(std::format(R"({{"accion":"criatura","raceId":{},"skinId":{}}})", idRaza, idPiel));
+            }
+            PonerEstado("Pedido al servidor. Si lo acepta, te transformará a ti y a los demás te verán igual.");
+        });
+    }
+
+    void PedirVolver()
+    {
+        SKSE::GetTaskInterface()->AddTask([]() {
+            spdlog::info("Pedir al servidor: volver");
+            caraPendiente.reset();
+            cambioPropio = true;  // si vuelve la raza propia, al terminar se desatasca
+            desatascarAlVolver = true;
+            EnviarPeticion(R"({"accion":"volver"})");
+            PonerEstado("Pedido al servidor volver a tu aspecto.");
+        });
+    }
+
     // Personas: toda su cara. Criaturas: raza y piel.
     void Transformar(RE::FormID idNpc, RE::FormID idRaza, RE::FormID idPiel)
     {
+        if (modoServidor) return PedirTransformacion(idNpc, idRaza, idPiel);
         SKSE::GetTaskInterface()->AddTask([idNpc, idRaza, idPiel]() {
             auto* raza = RE::TESForm::LookupByID<RE::TESRace>(idRaza);
             auto* npc = idNpc ? RE::TESForm::LookupByID<RE::TESNPC>(idNpc) : nullptr;
@@ -978,6 +1087,7 @@ namespace
 
     void Volver()
     {
+        if (modoServidor) return PedirVolver();
         SKSE::GetTaskInterface()->AddTask([]() {
             CargarOriginal();
             if (!original) {
@@ -1873,7 +1983,7 @@ namespace
         if (ImGui::Button(pestana == Pestana::kAcciones ? "Ejecutar" : "Transformarme", { 200, 0 }) || (intro && haySeleccion)) Transformarse();
         ImGui::EndDisabled();
         ImGui::SameLine();
-        ImGui::BeginDisabled(!transformado);
+        ImGui::BeginDisabled(!transformado && !modoServidor);  // en modo servidor, quien sabe si estás transformado es el servidor
         if (ImGui::Button("Volver a mi aspecto", { 200, 0 })) {
             Volver();
             Cerrar();
@@ -2065,8 +2175,10 @@ namespace
             GetModuleFileNameW(modulo, ruta, MAX_PATH)) {
             rutaIni = std::filesystem::path{ ruta }.replace_extension(L".ini");
             tecla = GetPrivateProfileIntW(L"General", L"Tecla", TECLA_POR_DEFECTO, rutaIni.c_str());
+            modoServidor = GetPrivateProfileIntW(L"Servidor", L"Modo", 1, rutaIni.c_str()) != 0;
         }
         spdlog::info("Tecla del menu: DIK {:#x}", tecla);
+        spdlog::info("Modo: {}", modoServidor ? "servidor (el menú pide la transformación al servidor)" : "local (sin servidor)");
     }
 
     void PrepararRegistro()
